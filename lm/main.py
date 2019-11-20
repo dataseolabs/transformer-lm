@@ -4,6 +4,7 @@ from pathlib import Path
 import statistics
 import shutil
 import sys
+from typing import Optional, List
 
 import attr
 import fire
@@ -37,14 +38,19 @@ def main(
         n_layer=12,
         n_hidden=None,  # equal to n_embed by default (better leave at None)
         clean=False,  # clean run folder
-        log_every=1,
-        save_every=1000,
+        log_every=20,
+        save_every=10000,
         validate_every=None,  # same as save_every by default
         only_validate=False,
         max_tokens=None,
+        opt_level=None,  # apex.amp opt level (e.g. "O1")
+        # train on contexts starting from sentence start
+        sample_sentences=False,
+        verbose=False,  # print all training contexts
+        # Multi-GPU related settings
         master_port='40390',
         master_addr='127.0.0.1',
-        # These are set automatically when multiple GPUs are available
+        # These two are set automatically when multiple GPUs are available
         device_id=None,
         n_devices=None,
         ):
@@ -110,6 +116,13 @@ def main(
     print(f'Train dataset has {len(train_dataset):,} tokens')
     print(f'Validation dataset has {len(valid_dataset):,} tokens')
 
+    if sample_sentences:
+        train_sample_index, valid_sample_index = [
+            _sentense_sample_index(dataset, n_ctx, sp_model)
+            for dataset in [train_dataset, valid_dataset]]
+    else:
+        train_sample_index = valid_sample_index = None
+
     if torch.cuda.is_available():
         device = torch.device('cuda', index=device_id)
     else:
@@ -119,6 +132,10 @@ def main(
     optimizer = optim.Adam(model.parameters(), lr=lr)
     loss_meter = AverageMeter()
     cudnn.benchmark = True
+    if opt_level:
+        from apex import amp
+        model, optimizer = amp.initialize(
+            model, optimizer, opt_level=opt_level)
 
     seen_tokens = 0
 
@@ -126,14 +143,15 @@ def main(
         """ Load model, update seen_tokens value
         """
         nonlocal seen_tokens
-        state = torch.load(model_path)
+        state = torch.load(model_path, map_location=device)
         if 'seen_tokens' in state:
             seen_tokens = state['seen_tokens']
         else:  # legacy format
             seen_tokens = state['step'] * step_tokens
         state_dict = fixed_state_dict(state['state_dict'])
         model.load_state_dict(state_dict)
-        optimizer.load_state_dict(torch.load(optimizer_path))
+        optimizer.load_state_dict(
+            torch.load(optimizer_path, map_location=device))
         print(f'Resuming from seen_tokens {seen_tokens:,}')
 
     if model_path.exists():
@@ -158,7 +176,15 @@ def main(
         """ Train step on one GPU.
         """
         context = _gen_training_batch(
-            train_dataset, n_ctx=n_ctx, batch_size=batch_size * accum_gradients)
+            train_dataset,
+            n_ctx=n_ctx,
+            batch_size=batch_size * accum_gradients,
+            sample_index=train_sample_index)
+        if verbose:
+            print()
+            for ctx in context:
+                print(repr(sp_model.decode_ids(list(map(int, ctx)))))
+            print()
         context = torch.LongTensor(context)
         optimizer.zero_grad()
         loss_scale = n_ctx * batch_size * accum_gradients / (512 * 4 * 32)
@@ -166,7 +192,12 @@ def main(
             ctx = ctx.to(device=device)
             logits = model(ctx)['logits']
             loss = loss_fn(logits, ctx)
-            (loss * loss_scale).backward()
+            loss_b = loss * loss_scale
+            if opt_level:
+                with amp.scale_loss(loss_b, optimizer) as scaled_loss:
+                    scaled_loss.backward()
+            else:
+                loss_b.backward()
             loss_meter.update(float(loss.item()))
         optimizer.step()
 
@@ -226,7 +257,8 @@ def main(
         losses = AverageMeter()
         with torch.no_grad():
             for ctx in _valid_batch_iter(
-                    valid_dataset, batch_size=batch_size, n_ctx=n_ctx):
+                    valid_dataset, batch_size=batch_size, n_ctx=n_ctx,
+                    sample_index=valid_sample_index):
                 if not ctx:
                     continue
                 ctx = torch.LongTensor(ctx).to(device)
@@ -264,14 +296,36 @@ def main(
                 sys.exit(1)
 
 
-def _gen_training_batch(dataset: np.ndarray, n_ctx: int, batch_size: int):
-    indices = [np.random.randint(0, len(dataset) - n_ctx)
-               for _ in range(batch_size)]
+def _sentense_sample_index(dataset: np.ndarray, n_ctx: int, sp_model):
+    # a very very dumb implementation for a start
+    period_id = sp_model.piece_to_id('.')
+    sample_index = np.nonzero(dataset == period_id)[0] + 1
+    return np.clip(sample_index, 0, len(dataset) - n_ctx - 1)
+
+
+def _gen_training_batch(
+        dataset: np.ndarray, n_ctx: int, batch_size: int,
+        sample_index: Optional[np.ndarray]) -> List[np.ndarray]:
+    if sample_index is not None:
+        indices = np.random.choice(sample_index, batch_size)
+    else:
+        indices = [np.random.randint(0, len(dataset) - n_ctx)
+                   for _ in range(batch_size)]
     return [dataset[idx: idx + n_ctx] for idx in indices]
 
 
-def _valid_batch_iter(dataset: np.ndarray, *, batch_size: int, n_ctx: int):
-    start_indices = range(0, len(dataset) - n_ctx, n_ctx)
+def _valid_batch_iter(
+        dataset: np.ndarray, *, batch_size: int, n_ctx: int,
+        sample_index: Optional[np.ndarray] = None,
+        ):
+    if sample_index is not None:
+        start_indices = []  # remove items which are too frequent
+        for i, idx in enumerate(sample_index):
+            if (i == 0 or i == len(sample_index) - 1 or
+                    sample_index[i + 1] > start_indices[-1] + n_ctx):
+                start_indices.append(idx)
+    else:
+        start_indices = range(0, len(dataset) - n_ctx, n_ctx)
     return _batch_it(
         (dataset[start_idx: start_idx + n_ctx] for start_idx in tqdm.tqdm(
             start_indices, desc='validation', leave=False)),

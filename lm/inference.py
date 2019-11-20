@@ -1,12 +1,10 @@
 import json
 from pathlib import Path
-from typing import List, Tuple
+from typing import List, Tuple, Optional, Dict
 
 import sentencepiece as spm
 import torch
 import numpy as np
-import fire
-from .fire_utils import only_allow_defined_args
 
 from .model import Model, HParams
 from .common import END_OF_LINE, END_OF_TEXT
@@ -16,21 +14,26 @@ class ModelWrapper:
     END_OF_LINE = END_OF_LINE
     END_OF_TEXT = END_OF_TEXT
 
-    def __init__(self, model: Model, sp_model: spm.SentencePieceProcessor):
+    def __init__(self, model: Model, sp_model: spm.SentencePieceProcessor,
+                 params: Optional[Dict]):
         self.model = model
         self.sp_model = sp_model
+        self.params = params or {}
 
     @classmethod
     def load(cls, root: Path):
         sp_model = spm.SentencePieceProcessor()
         sp_model.load(str(root / 'sp.model'))
-        hparams = json.loads((root / 'params.json').read_text())['hparams']
+        params = json.loads((root / 'params.json').read_text())
+        hparams = params['hparams']
         hparams.setdefault('n_hidden', hparams['n_embed'])
         model = Model(HParams(**hparams))
         state = torch.load(root / 'model.pt', map_location='cpu')
         state_dict = fixed_state_dict(state['state_dict'])
         model.load_state_dict(state_dict)
-        return cls(model, sp_model)
+        if 'seen_tokens' in state:
+            params['seen_tokens'] = state['seen_tokens']
+        return cls(model, sp_model, params=params)
 
     def tokenize(self, s: str) -> List[str]:
         return self.sp_model.EncodeAsPieces(s)
@@ -76,8 +79,12 @@ class ModelWrapper:
                        for i in next_log_probs.argsort()[-top_k:]],
                       reverse=True)
 
-    def generate_tokens(self, tokens_prefix: List[str], tokens_to_generate: int, top_k: int) -> List[str]:
-
+    def generate_tokens(
+            self,
+            tokens_prefix: List[str],
+            tokens_to_generate: int,
+            top_k: int,
+            ) -> List[str]:
         tokens = list(tokens_prefix)
 
         for i in range(tokens_to_generate):
@@ -92,7 +99,6 @@ class ModelWrapper:
             # pick next token randomly according to probs distribution
             next_token_n = np.random.choice(top_k, p=probs)
             next_token = ntk[next_token_n][1]
-            # print (next_token)
             
             tokens.append(next_token)
 
@@ -104,17 +110,3 @@ def fixed_state_dict(state_dict):
         # legacy multi-GPU format
         state_dict = {k[len('module.'):]: v for k, v in state_dict.items()}
     return state_dict
-
-def gen_main(model_path, prefix, tokens_to_generate=42, top_k=8):
-
-    print("loading model from %s" % model_path)
-    mw = ModelWrapper.load(Path(model_path))
-
-    print("generating text for prefix %s" % prefix)
-    tokens = mw.tokenize(prefix)
-
-    tokens_gen = mw.generate_tokens(tokens, tokens_to_generate, top_k)
-    print(mw.sp_model.DecodePieces(tokens_gen))
-
-def fire_gen_main():
-    fire.Fire(only_allow_defined_args(gen_main))

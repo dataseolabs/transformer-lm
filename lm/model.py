@@ -9,6 +9,7 @@ from torch import nn
 from torch.nn import functional as F
 import torch.utils.checkpoint
 
+
 @attr.s(auto_attribs=True, frozen=True)
 class HParams:
     n_vocab: int
@@ -17,7 +18,7 @@ class HParams:
     n_hidden: int
     n_head: int
     n_layer: int
-    gradient_checkpointing: bool
+    gradient_checkpointing: bool = False
 
 
 class Model(nn.Module):
@@ -50,9 +51,11 @@ class Model(nn.Module):
         presents = []
         for i, block in enumerate(self.blocks):
             if self.hparams.gradient_checkpointing:
-                h, present = torch.utils.checkpoint.checkpoint(block, h, past[:, i] if past is not None else None)
+                h, present = torch.utils.checkpoint.checkpoint(
+                    block, h, past[:, i] if past is not None else None)
             else:
-                h, present = block(h, past=past[:, i] if past is not None else None)
+                h, present = block(
+                    h, past=past[:, i] if past is not None else None)
             presents.append(present)
         h = self.ln_f(h)
         if self.out_proj:
@@ -172,7 +175,7 @@ class Attention(nn.Module):
         _, _, nd, ns = w.shape
         b = self.attention_mask(nd, ns, dtype=w.dtype, device=w.device)
         b = b.reshape((1, 1, nd, ns))
-        w = w * b - 1e10 * (1 - b)
+        w = w * b - 1e4 * (1 - b)
         return w
 
     @staticmethod
